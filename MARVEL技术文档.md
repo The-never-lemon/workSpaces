@@ -1119,6 +1119,156 @@ A* 路径规划（NodeManager.a_star）
 
 ---
 
+## 12. 原版 baseline 的工程缺陷诊断
+
+> 本章节基于对 `D:\工作区\MARVEL\` 原版代码的逐行审阅，**不针对论文实验设置内成功的部分**（论文 Table I-III 在 N ∈ {2,4,8} 时全部 100% 成功），而是聚焦于"在论文外场景将会失效"的设计缺陷。这些缺陷与 `期刊级研究规划.md` 的 C1-C5 一一对应。
+
+### 12.1 决策与协调层
+
+#### 12.1.1 协调机制完全依赖端到端涌现
+原版 4 件套协调机制（occupancy ternary + 距离排序 reroute + privileged critic + 运动模型兜底）**没有任何显式联合优化层**：
+
+- `multi_agent_worker.py:75-110` 中的 reroute 仅按距离排序 + 四叉树最近邻替代，不考虑替代节点的 utility / Q 值；
+- `occupancy ∈ {-1, 0, 1}` 信息容量极低，多 Agent 进入同一区域时无法区分；
+- attentive privileged critic（`model.py:368-380` 的 `agent_decoder`）仅训练期生效，执行期 actor 仍独立采样；
+- 这套机制依赖 SAC 训练时把"避让"压入策略权重——但**当 N_agents 偏离训练分布、或地图拓扑变化时，无显式 fallback**。
+
+**对接：C1 VJC（Value-Aware Joint Coordination）**——把执行期协调升级为价值驱动的 K×3 联合 ILP 分配，作为 reroute 的 principled 替代。
+
+#### 12.1.2 朝向脱离协调
+原版动作空间是 (节点 × 朝向) = K×3 = 75，但 reroute 只对节点冲突重路由，朝向**强制保留**。当目标节点被替换后，原本对应"目标方向"的朝向变成了"反方向"——与 MARVEL 的 heading-aware 核心创新逻辑冲突。
+
+**对接：C1 VJC 的 K×3 联合分配**。
+
+#### 12.1.3 距离排序破坏 SAC 信用对称性
+`arriving_sequence = np.argsort(dist_list)` 让远距离 Agent 总是让步。这等价于隐含的"二等公民"——长期训练中那些初始距离偏大的 Agent 会习得"主动放弃高价值节点"的退化策略。
+
+**对接：C1 VJC 用 SAC 目标 Q-α log π 作为代价，对所有 Agent 对称处理**。
+
+### 12.2 通信与可扩展性层
+
+#### 12.2.1 全连通通信硬假设
+论文 Section III.A 显式声明 *"perfect communication between agents, allowing them to exchange information and maintain a shared map"*。代码层面，`env.py:robot_belief` 是单一共享变量，所有 Agent 在 `update_robot_belief` 中写入同一个数组——这等价于零延迟、零丢包、无距离衰减的理想通信信道。
+
+**对接：C3 CC-CTDE**——把通信图、距离限制、丢包率作为训练随机化变量。
+
+#### 12.2.2 N_AGENTS / 地图尺度硬编码
+- `parameter.py:35` `N_AGENTS = 4` 是常量；`env.py:39` 用 `N_AGENTS` 采样初始位置——训练时 N 不变；
+- `parameter.py:83` `NODE_PADDING_SIZE = 360` 是常量，无 batch 内动态调整；
+- 测试时虽然可改 N，但策略本身从未见过 N≠4 的训练分布。
+
+**对接：C4 C³T**——课程式 N、FoV、ds、map_scale 采样 + Set-encoded occupancy 实现置换不变 + sinusoidal 坐标编码实现尺度无关。
+
+### 12.3 训练算法层
+
+#### 12.3.1 折扣因子 γ=1 与有限视界的张力
+- `parameter.py:73` GAMMA=1，但 `MAX_EPISODE_STEP=128` 是软上限；
+- 当 episode 在 128 步被截断（未完成探索），Q 网络仍按"未完成"自举 → bootstrap 偏差；
+- 这在 Pearl/Sutton 文献中被称为 *spurious bootstrapping*，对小 buffer 的 SAC 尤其有害。
+
+**对接：可纳入 C5 理论分析章节作为命题 2 的边界条件讨论**。
+
+#### 12.3.2 目标网络硬复制 vs SAC 标准软更新
+`driver.py:332-338` 每 64 次 Q 更新执行完整 `load_state_dict`（硬复制），而 SAC 原文用 Polyak 软更新 τ=0.005。硬更新在 LR=1e-5 的小步长下会引入周期性目标突变，可能减慢收敛或引发振荡。
+
+**对接：工程优化项**，不直接构成方法 contribution，但实施 C1-C4 时可顺手修补。
+
+#### 12.3.3 Replay buffer 容量与样本利用率失衡
+- `REPLAY_SIZE=10000`、N_AGENTS=4、平均 episode ~100 步 → 约 25 个 episode 的数据；
+- SAC 通用配置是 1e5–1e6；
+- BATCH_SIZE=256，每 episode 4 次更新，样本平均复用率仅 ~1.5 次。
+
+**对接：工程项 + C5 理论命题的样本复杂度边界**。
+
+#### 12.3.4 trajectory_reward 几乎是常数
+`multi_agent_worker.py:179` `trajectory_reward = np.cos(robot.heading - trajectory_angle)`，但 `compute_allowable_heading` 已经把 final_heading 强行设为运动方向——在 yaw_rate 充足时该项恒为 1，不传递梯度信号。
+
+**对接：奖励函数清理项**，可在 C1 实施时同步移除。
+
+### 12.4 网络架构层
+
+#### 12.4.1 SingleHeadAttention 未对填充候选屏蔽 logits
+`model.py:42-44` 的 `SingleHeadAttention.forward`：
+
+```python
+if mask is not None:
+    U = U.masked_fill(mask == 1, -1e8)
+attention = torch.log_softmax(U, dim=-1)
+```
+
+mask 只屏蔽**编码器侧**的 `node_padding_mask`；指针网络对 K×3=75 个候选的输出层**没有对邻居层的 edge_padding_mask 屏蔽**。当真实邻居数 < 25 时，`multinomial(logp.exp())` 可能采样到填充位置（节点索引 0）。
+
+**对接：实施 C1 VJC 时需要顺手修复此 bug**（VJC 的 cost 矩阵也需要对填充候选 mask）。
+
+#### 12.4.2 occupancy ternary 信息瓶颈
+`agent.py` 中 `occupancy` 是 scalar，编码三种状态。对 N=2 或 N=4 时勉强可用，但 N≥8 时同一节点附近可能有多个 Agent，ternary 信号丧失分辨能力。
+
+**对接：C4 C³T 的 Set-encoded occupancy** —— 将 scalar 升级为对队友 set 的 attention 输出。
+
+### 12.5 工程实现层
+
+| 缺陷 | 文件 | 影响 |
+|------|------|------|
+| 训练/测试默认参数不完全一致 | `parameter.py` vs `test_parameter.py` 在 `UPDATING_MAP_SIZE` 等参数上不同 | 已知偏差，文档需补 |
+| Ray worker 无 seed 控制 | `runner.py` | episode 复现性差 |
+| `NUM_EPISODE_BUFFER=40` 是字段数非 episode 数 | `parameter.py:32` | 命名误导 |
+| 视频生成依赖 episode_index 全局唯一 | `env.py:18` | 多进程并发可能冲突 |
+
+**对接：工程修补项**，在 Week 12-13 整体修复。
+
+---
+
+## 13. 与期刊级研究规划的映射
+
+下表把第 12 章列出的 baseline 缺陷与 `期刊级研究规划.md` 中的 5 个 contribution 一一对接，作为两份文档的**接口表**：
+
+| 缺陷 ID | 描述 | 对应 contribution | 期刊规划章节 |
+|---------|------|------------------|--------------|
+| 12.1.1 | 协调机制无显式联合优化层 | **C1 VJC** | §3 |
+| 12.1.2 | 朝向脱离协调 | **C1 VJC（K×3 联合）** | §3.2 Step 2 |
+| 12.1.3 | 距离排序破坏 SAC 对称性 | **C1 VJC + C5 命题 2** | §3.4 + §7 |
+| 12.2.1 | 全连通通信硬假设 | **C3 CC-CTDE** | §5 |
+| 12.2.2 | N_AGENTS / 地图尺度硬编码 | **C4 C³T** | §6 |
+| 12.3.1 | γ=1 与有限视界张力 | **C5 命题 2 边界** | §7.1 |
+| 12.3.2 | 目标网络硬复制 | 工程项 | §10 Week 12 |
+| 12.3.3 | Replay buffer 过小 | 工程项 + C5 样本复杂度 | §7.1 |
+| 12.3.4 | trajectory_reward 失效 | 奖励清理 | §3.5 实施时顺手 |
+| 12.4.1 | SingleHeadAttention 未 mask logits | C1 VJC 实施时修复 | §3.5 |
+| 12.4.2 | occupancy ternary 瓶颈 | **C4 C³T Set Attention** | §6.2.2 |
+| 12.5.* | 工程实现层 | 全量修补 | §10 Week 12 |
+
+**两份文档的角色分工**：
+
+- 本文档（`MARVEL技术文档.md`）= baseline 解读 + 缺陷诊断（**"是什么"**）
+- `期刊级研究规划.md` = 创新方案 + 实施细节 + 实验设计（**"做什么"**）
+- `缺陷诊断与切入点决策.md` = 优先级与切入策略（**"先做什么"**）
+
+---
+
+## 14. 推荐的研究切入路径
+
+根据 C1-C5 的 dependency 与最低风险原则：
+
+```
+        Week 1-2   →   Week 3-4   →   Week 5     →   Week 6-7   →   Week 8+
+        ────────       ────────       ─────         ─────────       ──────
+        C1 VJC     →   C2 ISCP   →   C3 CC-CTDE →   C4 C³T      →   C5 Theory
+        (基础)         (去中心化)     (通信受限)      (跨规模)        (理论)
+            │              │              │              │              │
+            └───────────────────── Week 12 全量 ablation ─────────────────┘
+                                       │
+                                       ▼
+                              Week 13-15 论文写作
+```
+
+**最关键的 1 个决策点**：Week 2 末（C1 实施完）做一次 50-ep × 3 cost mode 的 MVV（Minimum Viable Validation）。如果 `Q − α log π` 的探索率 ≥ 原版 reroute 的 95%，整个 13-15 周计划证明可行；否则按规划 §12 fallback。
+
+---
+
+*文档生成日期：2026-06-25（v2，对接 baseline = `D:\工作区\MARVEL\`）*
+*配套文档：`期刊级研究规划.md`（科研方向）、`缺陷诊断与切入点决策.md`（切入策略）*
+
+
 ## 附录 A：快速参考命令
 
 ```bash
