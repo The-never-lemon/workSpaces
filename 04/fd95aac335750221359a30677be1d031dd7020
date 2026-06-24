@@ -1,0 +1,21 @@
+期刊级研究规划.md
+  s_43f4a0d1be35cc::t_a60a36ccbe3f1e 1-703
+MARVEL技术文档.md
+  s_43f4a0d1be35cc::t_15f4533fb1247a 1122-1271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.18-trip",
+  "base_commit_sha": "04fd95aac335750221359a30677be1d031dd7020",
+  "prompts": {},
+  "sessions": {
+    "s_43f4a0d1be35cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2956a648-e09e-46e7-8852-1748655c39ce",
+        "model": "arn:aws:bedrock:us-west-2:133197901387:application-inference-profile/ypvzpmevzxdl"
+      },
+      "human_author": "Junru Zhu （朱俊儒） <junruzhu@trip.com>"
+    }
+  }
+}
