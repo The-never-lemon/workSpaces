@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell([Environment]::SetEnvironmentVariable\\('ANTHROPIC_AUTH_TOKEN', $null, 'User'\\))",
+      "Bash(gh --version)",
+      "Bash(git remote *)",
+      "Bash(git add *)"
+    ]
+  }
+}
